@@ -1,0 +1,319 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - '*.md'
+      - 'docs/**'
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: movepay-secrets
+  - name: AZURE_CONNECTION
+    value: 'movepay-azure-connection'
+  - name: SUBSCRIPTION_ID
+    value: 'fdddaca3-a991-4301-8149-389bb3aaf4f9'
+  - name: LOCATION
+    value: 'westeurope'
+  - name: PYTHON_VERSION
+    value: '3.10'
+
+
+stages:
+- stage: Validate
+  displayName: Validate Bicep templates
+  jobs:
+  - job: Lint
+    displayName: Lint + what-if (dev)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureCLI@2
+      displayName: Install Bicep
+      inputs:
+        azureSubscription: $(AZURE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: az bicep install
+
+    - task: AzureCLI@2
+      displayName: Bicep lint
+      inputs:
+        azureSubscription: $(AZURE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: az bicep lint --file movepay-infra/main.bicep
+
+    - task: AzureCLI@2
+      displayName: What-if preview (dev)
+      inputs:
+        azureSubscription: $(AZURE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az deployment group what-if \
+            --subscription $(SUBSCRIPTION_ID) \
+            --resource-group rg-movepay-dev \
+            --template-file movepay-infra/main.bicep \
+            --parameters movepay-infra/parameters/dev.bicepparam \
+            --parameters sqlAdminPassword='$(SQL_ADMIN_PASSWORD_DEV)'
+
+
+- stage: Build
+  displayName: Build Function App
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: BuildPython
+    displayName: Package Python function
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(PYTHON_VERSION)
+
+    - script: |
+        cd payment-func-app
+        pip install -r requirements.txt --target='.python_packages/lib/site-packages'
+      displayName: Install Python dependencies
+
+    - task: ArchiveFiles@2
+      displayName: Create deployment zip
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)/payment-func-app'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: '$(Build.ArtifactStagingDirectory)/function-app.zip'
+        replaceExistingArchive: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish function zip
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/function-app.zip'
+        artifact: function-app
+        publishLocation: pipeline
+
+
+- stage: DeployDev
+  displayName: Deploy to Dev
+  dependsOn: Build
+  condition: succeeded()
+  variables:
+    ENV: dev
+    RG: rg-movepay-dev
+  jobs:
+  - deployment: InfraDev
+    displayName: Infrastructure (dev)
+    environment: movepay-dev
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Deploy Bicep (dev)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az deployment group create \
+                  --subscription $(SUBSCRIPTION_ID) \
+                  --resource-group $(RG) \
+                  --template-file movepay-infra/main.bicep \
+                  --parameters movepay-infra/parameters/dev.bicepparam \
+                  --parameters sqlAdminPassword='$(SQL_ADMIN_PASSWORD_DEV)' \
+                  --name "deploy-$(ENV)-$(Build.BuildId)"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download function zip
+            inputs:
+              artifact: function-app
+              path: $(Pipeline.Workspace)/drop
+
+          - task: AzureFunctionApp@2
+            displayName: Deploy Function App (dev)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              appType: functionAppLinux
+              appName: func-movepay-$(ENV)
+              package: $(Pipeline.Workspace)/drop/function-app.zip
+              deploymentMethod: zipDeploy
+              runtimeStack: PYTHON|3.10
+
+          - task: AzureCLI@2
+            displayName: Store function key in Key Vault (dev)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Wait for Function App to start
+                sleep 30
+                # Fetch the default host key
+                FUNC_KEY=$(az functionapp keys list \
+                  --name func-movepay-$(ENV) \
+                  --resource-group $(RG) \
+                  --query functionKeys.default -o tsv)
+                # Store it in Key Vault
+                KV_NAME=$(az keyvault list \
+                  --resource-group $(RG) \
+                  --query "[0].name" -o tsv)
+                az keyvault secret set \
+                  --vault-name $KV_NAME \
+                  --name function-key-payment-processor \
+                  --value "$FUNC_KEY"
+                echo "Function key stored in Key Vault: $KV_NAME"
+
+
+- stage: DeployTest
+  displayName: Deploy to Test
+  dependsOn: DeployDev
+  condition: succeeded()
+  variables:
+    ENV: test
+    RG: rg-movepay-test
+  jobs:
+  - deployment: InfraTest
+    displayName: Infrastructure + App (test)
+    environment: movepay-test
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Deploy Bicep (test)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az deployment group create \
+                  --subscription $(SUBSCRIPTION_ID) \
+                  --resource-group $(RG) \
+                  --template-file movepay-infra/main.bicep \
+                  --parameters movepay-infra/parameters/test.bicepparam \
+                  --parameters sqlAdminPassword='$(SQL_ADMIN_PASSWORD_TEST)' \
+                  --name "deploy-$(ENV)-$(Build.BuildId)"
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: function-app
+              path: $(Pipeline.Workspace)/drop
+
+          - task: AzureFunctionApp@2
+            displayName: Deploy Function App (test)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              appType: functionAppLinux
+              appName: func-movepay-$(ENV)
+              package: $(Pipeline.Workspace)/drop/function-app.zip
+              deploymentMethod: zipDeploy
+              runtimeStack: PYTHON|3.10
+
+          - task: AzureCLI@2
+            displayName: Store function key in Key Vault (test)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                sleep 30
+                FUNC_KEY=$(az functionapp keys list \
+                  --name func-movepay-$(ENV) \
+                  --resource-group $(RG) \
+                  --query functionKeys.default -o tsv)
+                KV_NAME=$(az keyvault list \
+                  --resource-group $(RG) \
+                  --query "[0].name" -o tsv)
+                az keyvault secret set \
+                  --vault-name $KV_NAME \
+                  --name function-key-payment-processor \
+                  --value "$FUNC_KEY"
+
+
+- stage: DeployProd
+  displayName: Deploy to Production
+  dependsOn: DeployTest
+  condition: succeeded()
+  variables:
+    ENV: prod
+    RG: rg-movepay-prod
+  jobs:
+  - deployment: InfraProd
+    displayName: Infrastructure + App (prod)
+    environment: movepay-prod
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Deploy Bicep (prod)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az deployment group create \
+                  --subscription $(SUBSCRIPTION_ID) \
+                  --resource-group $(RG) \
+                  --template-file movepay-infra/main.bicep \
+                  --parameters movepay-infra/parameters/prod.bicepparam \
+                  --parameters sqlAdminPassword='$(SQL_ADMIN_PASSWORD_PROD)' \
+                  --name "deploy-$(ENV)-$(Build.BuildId)"
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: function-app
+              path: $(Pipeline.Workspace)/drop
+
+          - task: AzureFunctionApp@2
+            displayName: Deploy Function App (prod)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              appType: functionAppLinux
+              appName: func-movepay-$(ENV)
+              package: $(Pipeline.Workspace)/drop/function-app.zip
+              deploymentMethod: zipDeploy
+              runtimeStack: PYTHON|3.10
+
+          - task: AzureCLI@2
+            displayName: Store function key in Key Vault (prod)
+            inputs:
+              azureSubscription: $(AZURE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                sleep 30
+                FUNC_KEY=$(az functionapp keys list \
+                  --name func-movepay-$(ENV) \
+                  --resource-group $(RG) \
+                  --query functionKeys.default -o tsv)
+                KV_NAME=$(az keyvault list \
+                  --resource-group $(RG) \
+                  --query "[0].name" -o tsv)
+                az keyvault secret set \
+                  --vault-name $KV_NAME \
+                  --name function-key-payment-processor \
+                  --value "$FUNC_KEY"
+                echo "Production deployment complete."
